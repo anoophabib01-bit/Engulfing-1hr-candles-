@@ -1,219 +1,166 @@
 """
 EdgeDesk Setup Monitor — Cloud Worker
-Monitors NQ=F (MNQ proxy) and GC=F (MGC proxy) every 5 minutes.
-Checks Playbook A/B/C on 1H bars and fires Telegram when conditions are met.
-Session window: 07:30–15:30 UTC (1:00 PM – 9:00 PM IST)
+Triggers Telegram when a 1H candle fully engulfs the previous candle (wicks included).
+No direction filter. Session: 07:30–15:30 UTC (1:00 PM – 9:00 PM IST)
 """
 
+import json
+import os
 import time
 import requests
 import schedule
 import yfinance as yf
 from datetime import datetime, timezone
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 TG_TOKEN  = "8929601303:AAH3CMZaYBZVZsTF9ZdUkG8oQsJoJyuQDA8"
 TG_CHAT   = "1634079730"
 
-# Yahoo Finance tickers — same price action as MNQ1! / MGC1!
 SYMBOLS = {
     "MNQ": "NQ=F",
     "MGC": "GC=F",
 }
 
-COOLDOWN_SEC = 300   # 5-min cooldown per playbook per symbol
-cooldowns: dict = {}
+COOLDOWN_SEC  = 4 * 60 * 60  # 4 hours — same candle won't re-alert
+COOLDOWN_FILE = "cooldowns.json"
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Cooldown (persisted to disk so restarts don't re-trigger) ────────────────
+def load_cooldowns() -> dict:
+    if os.path.exists(COOLDOWN_FILE):
+        try:
+            with open(COOLDOWN_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_cooldowns(cd: dict):
+    try:
+        with open(COOLDOWN_FILE, "w") as f:
+            json.dump(cd, f)
+    except Exception as e:
+        print(f"[COOLDOWN SAVE ERROR] {e}")
+
+cooldowns = load_cooldowns()
+
+def is_cooled_down(key: str) -> bool:
+    return time.time() - cooldowns.get(key, 0) < COOLDOWN_SEC
+
+def set_cooldown(key: str):
+    cooldowns[key] = time.time()
+    save_cooldowns(cooldowns)
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(msg: str):
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(
+        r = requests.post(
             url,
             json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
             timeout=10,
         )
+        print(f"[TG] {r.status_code}")
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
-
 # ── Session check ─────────────────────────────────────────────────────────────
 def get_session() -> str | None:
-    """Returns session label if within 07:30–15:30 UTC, else None."""
     now = datetime.now(timezone.utc)
     h = now.hour + now.minute / 60
     if 7.5 <= h <= 15.5:
         return "🇬🇧 London" if h <= 10.5 else "🗽 NY"
     return None
 
-
 # ── Data fetch ────────────────────────────────────────────────────────────────
-def fetch_bars(ticker: str, interval: str, period: str) -> list[dict]:
-    """Returns list of OHLC dicts, excluding the last (potentially forming) bar."""
+def fetch_bars(ticker: str) -> list[dict]:
     try:
-        df = yf.download(ticker, period=period, interval=interval,
+        df = yf.download(ticker, period="5d", interval="1h",
                          progress=False, auto_adjust=True)
         if df.empty:
             return []
+        if hasattr(df.columns, "levels"):
+            df.columns = df.columns.get_level_values(0)
         bars = [
             {
-                "open":  float(row["Open"].iloc[0])  if hasattr(row["Open"], "iloc") else float(row["Open"]),
-                "high":  float(row["High"].iloc[0])  if hasattr(row["High"], "iloc") else float(row["High"]),
-                "low":   float(row["Low"].iloc[0])   if hasattr(row["Low"], "iloc") else float(row["Low"]),
-                "close": float(row["Close"].iloc[0]) if hasattr(row["Close"], "iloc") else float(row["Close"]),
+                "open":  float(row["Open"]),
+                "high":  float(row["High"]),
+                "low":   float(row["Low"]),
+                "close": float(row["Close"]),
             }
             for _, row in df.iterrows()
         ]
-        return bars[:-1]  # drop last forming candle
+        return bars[:-1]  # drop last potentially-forming candle
     except Exception as e:
-        print(f"[FETCH ERROR] {ticker} {interval}: {e}")
+        print(f"[FETCH ERROR] {ticker}: {e}")
         return []
 
-
-# ── Playbook detection ────────────────────────────────────────────────────────
-def check_playbooks(bars_1h: list, bars_4h: list, label: str, sess: str):
-    now_ts = time.time()
-
-    if len(bars_1h) < 10:
-        print(f"[{label}] Not enough 1H bars ({len(bars_1h)}), skipping.")
+# ── Engulf check ──────────────────────────────────────────────────────────────
+def check_engulf(bars: list, label: str, sess: str):
+    if len(bars) < 2:
+        print(f"[{label}] Not enough bars.")
         return
 
-    c = bars_1h[-10:]   # last 10 confirmed closed 1H candles
-    recent = bars_1h[-6:]  # last 6 for SFP/FVG
+    prev = bars[-2]
+    curr = bars[-1]
 
-    # 4H bias
-    bias_4h = None
-    if bars_4h:
-        last4h = bars_4h[-1]
-        bias_4h = "Bullish" if last4h["close"] > last4h["open"] else "Bearish"
+    # Full engulf including wicks: curr range must completely contain prev range
+    engulfed = curr["high"] >= prev["high"] and curr["low"] <= prev["low"]
 
-    # ── PLAYBOOK A: 1H Engulfing + 4H Direction ──────────────────────────
-    if bias_4h and len(c) >= 2:
-        prev, curr = c[-2], c[-1]
+    direction = "Bullish" if curr["close"] > curr["open"] else "Bearish"
 
-        bull_eng = (
-            curr["close"] > curr["open"]
-            and curr["open"]  <= prev["close"]
-            and curr["close"] >= prev["open"]
-        )
-        bear_eng = (
-            curr["close"] < curr["open"]
-            and curr["open"]  >= prev["close"]
-            and curr["close"] <= prev["open"]
-        )
-        eng_dir = "Bullish" if bull_eng else ("Bearish" if bear_eng else None)
-
-        if eng_dir and eng_dir == bias_4h:
-            key = f"{label}_A"
-            if now_ts - cooldowns.get(key, 0) > COOLDOWN_SEC:
-                cooldowns[key] = now_ts
-                print(f"[{label}] PLAYBOOK A triggered")
-                send_telegram(
-                    f"⚡ <b>PLAYBOOK A — {label} {sess}</b>\n"
-                    f"✅ 1H Engulfing candle confirmed\n"
-                    f"✅ Matches 4H {bias_4h} bias\n"
-                    f"Candle: {prev['open']:.1f}→{prev['close']:.1f} "
-                    f"engulfed by {curr['open']:.1f}→{curr['close']:.1f}\n"
-                    f"Price: {curr['close']:.1f}\n"
-                    f"Check {label} chart now."
-                )
-
-    # ── PLAYBOOK B: SFP + FVG ────────────────────────────────────────────
-    sfp_found = False
-    for i in range(1, len(recent)):
-        pb, cb = recent[i - 1], recent[i]
-        bear_sfp = cb["high"] > pb["high"] and cb["close"] < pb["high"]
-        bull_sfp = cb["low"]  < pb["low"]  and cb["close"] > pb["low"]
-        if bear_sfp or bull_sfp:
-            sfp_found = True
-            break
-
-    fvg_found = False
-    for i in range(len(recent) - 2):
-        a, _, cc = recent[i], recent[i + 1], recent[i + 2]
-        if cc["low"] > a["high"] or cc["high"] < a["low"]:
-            fvg_found = True
-            break
-
-    if sfp_found and fvg_found:
-        key = f"{label}_B"
-        if now_ts - cooldowns.get(key, 0) > COOLDOWN_SEC:
-            cooldowns[key] = now_ts
-            print(f"[{label}] PLAYBOOK B triggered")
+    if engulfed:
+        key = f"{label}_engulf"
+        if not is_cooled_down(key):
+            set_cooldown(key)
+            print(f"[{label}] ✅ Engulfing candle detected ({direction})")
             send_telegram(
-                f"⚡ <b>PLAYBOOK B — {label} {sess}</b>\n"
-                f"✅ SFP detected on 1H\n"
-                f"✅ FVG present as entry zone\n"
-                f"Price: {c[-1]['close']:.1f}\n"
-                f"Check {label} chart now."
+                f"⚡ <b>1H Engulfing — {label} {sess}</b>\n"
+                f"Direction: {direction}\n"
+                f"Prev range:  {prev['low']:.1f} – {prev['high']:.1f}\n"
+                f"Curr range:  {curr['low']:.1f} – {curr['high']:.1f}\n"
+                f"Curr candle: {curr['open']:.1f} → {curr['close']:.1f}\n"
+                f"Price: {curr['close']:.1f}"
             )
-
-    # ── PLAYBOOK C: Liquidity Raid ────────────────────────────────────────
-    if len(c) >= 6:
-        window     = c[-6:-1]
-        swing_high = max(b["high"] for b in window)
-        swing_low  = min(b["low"]  for b in window)
-        last = c[-1]
-
-        bull_raid = last["low"]  < swing_low  and last["close"] > swing_low
-        bear_raid = last["high"] > swing_high and last["close"] < swing_high
-
-        if bull_raid or bear_raid:
-            direction = "Bullish" if bull_raid else "Bearish"
-            level     = swing_low if bull_raid else swing_high
-            key = f"{label}_C"
-            if now_ts - cooldowns.get(key, 0) > COOLDOWN_SEC:
-                cooldowns[key] = now_ts
-                print(f"[{label}] PLAYBOOK C triggered")
-                send_telegram(
-                    f"⚡ <b>PLAYBOOK C — {label} {sess}</b>\n"
-                    f"✅ Liquidity {direction} raid on 1H\n"
-                    f"Swept level: {level:.1f}\n"
-                    f"Closed back at: {last['close']:.1f}\n"
-                    f"Check {label} chart now."
-                )
-
+        else:
+            print(f"[{label}] Engulf detected but in cooldown — skipping.")
+    else:
+        print(f"[{label}] No engulf. "
+              f"Curr H:{curr['high']:.1f} L:{curr['low']:.1f} | "
+              f"Prev H:{prev['high']:.1f} L:{prev['low']:.1f}")
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
 def run_scan():
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     sess = get_session()
     if not sess:
-        print(f"[{datetime.now(timezone.utc).strftime('%H:%M')} UTC] Outside session window — skipping.")
+        print(f"[{now_str}] Outside session — skipping.")
         return
 
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M')} UTC] Scanning — {sess}")
+    print(f"[{now_str}] Scanning — {sess}")
 
     for label, ticker in SYMBOLS.items():
         try:
-            bars_1h = fetch_bars(ticker, "1h", "7d")
-            bars_4h = fetch_bars(ticker, "4h", "14d")
-
-            if not bars_1h:
+            bars = fetch_bars(ticker)
+            if not bars:
                 send_telegram(
                     f"⚠️ <b>EdgeDesk Monitor — Data Error</b>\n"
-                    f"No 1H data returned for {label} ({ticker}).\n"
-                    f"Yahoo Finance may be rate-limiting."
+                    f"No data for {label} ({ticker})."
                 )
                 continue
-
-            check_playbooks(bars_1h, bars_4h, label, sess)
-
+            check_engulf(bars, label, sess)
         except Exception as e:
             send_telegram(
                 f"⚠️ <b>EdgeDesk Monitor — Error</b>\n"
-                f"Symbol: {label} ({ticker})\n"
-                f"Error: {str(e)}"
+                f"{label}: {str(e)}"
             )
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("EdgeDesk Setup Monitor starting...")
     send_telegram(
         "🟢 <b>EdgeDesk Monitor Online</b>\n"
-        "Scanning MNQ + MGC every 5 min\n"
-        "Session: 1:00 PM – 9:00 PM IST\n"
-        "Playbooks: A (Engulf+4H) · B (SFP+FVG) · C (Liq Raid)"
+        "MNQ + MGC · 1H full engulf (wicks) · Any direction\n"
+        "Session: 1:00 PM – 9:00 PM IST"
     )
 
     schedule.every(5).minutes.do(run_scan)
